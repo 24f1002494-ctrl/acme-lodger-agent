@@ -1,277 +1,34 @@
 const TTL_MS = 5 * 60 * 1000;
 let cache = { loadedAt: 0, orders: null };
 
-function env(name) {
-  const value = process.env[name];
-  if (!value) throw new Error(`Missing environment variable: ${name}`);
-  return value;
-}
-
-function upstream(path, extra = {}) {
-  const url = new URL("https://exam.sanand.workers.dev/questionData");
-  url.searchParams.set("email", env("QUIZ_EMAIL"));
-  url.searchParams.set("quizSign", env("QUIZ_SIGN"));
-  url.searchParams.set("questionId", "q-ledger-agent-server");
-  url.searchParams.set("path", path);
-  for (const [k, v] of Object.entries(extra)) url.searchParams.set(k, String(v));
-  return url.toString();
-}
-
-function unwrapRows(value) {
-  if (Array.isArray(value)) return value;
-  if (!value || typeof value !== "object") return [];
-  for (const key of ["orders", "data", "rows", "results", "records", "items"])
-    if (Array.isArray(value[key])) return value[key];
-  return [];
-}
-
-function parseCsv(text) {
-  const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/).filter(x => x.trim());
-  if (!lines.length) return [];
-  const parseLine = line => {
-    const out = []; let cur = "", quoted = false;
-    for (let i = 0; i < line.length; i++) {
-      const c = line[i];
-      if (c === '"') {
-        if (quoted && line[i + 1] === '"') { cur += '"'; i++; }
-        else quoted = !quoted;
-      } else if (c === "," && !quoted) { out.push(cur); cur = ""; }
-      else cur += c;
-    }
-    out.push(cur); return out;
-  };
-  const headers = parseLine(lines[0]).map(x => x.trim());
-  return lines.slice(1).map(line => {
-    const vals = parseLine(line), row = {};
-    headers.forEach((h, i) => row[h] = vals[i] ?? "");
-    return row;
-  });
-}
-
-function parseNdjson(text) {
-  const rows = [];
-  for (const line of text.replace(/^\uFEFF/, "").split(/\r?\n/)) {
-    const s = line.trim();
-    if (!s) continue;
-    const value = JSON.parse(s);
-    if (Array.isArray(value)) rows.push(...value);
-    else if (value && typeof value === "object") rows.push(value);
-  }
-  return rows;
-}
-
-async function fetchExport() {
-  const r = await fetch(upstream("/export"), { cache: "no-store" });
-  const text = await r.text();
-  const ct = r.headers.get("content-type") || "";
-  if (!r.ok) throw new Error(`Export HTTP ${r.status}`);
-  if (ct.includes("ndjson") || text.trim().startsWith("{")) {
-    try {
-      const parsed = JSON.parse(text);
-      const rows = unwrapRows(parsed);
-      if (rows.length) return rows;
-    } catch (_) {}
-    return parseNdjson(text);
-  }
-  if (ct.includes("csv")) return parseCsv(text);
-  try { return unwrapRows(JSON.parse(text)); }
-  catch { return parseCsv(text); }
-}
-
-function dateValue(row) { return row.updated_at ?? row.updatedAt ?? row.created_at ?? row.createdAt ?? ""; }
-
-function currentRows(rows) {
-  const byId = new Map();
-  for (const row of rows) {
-    const id = String(row.id ?? row.order_id ?? row.orderId ?? "");
-    if (!id) continue;
-    const old = byId.get(id);
-    if (!old || new Date(dateValue(row)).getTime() >= new Date(dateValue(old)).getTime()) byId.set(id, row);
-  }
-  return [...byId.values()];
-}
-
-function num(v) {
-  const n = Number(String(v ?? "").replace(/[$,\s]/g, ""));
-  return Number.isFinite(n) ? n : 0;
-}
-function first(row, keys, fallback = "") {
-  for (const k of keys) if (row[k] !== undefined && row[k] !== null && row[k] !== "") return row[k];
-  return fallback;
-}
-function moneyToCents(row) {
-  for (const [k, mult] of [["amount_cents",1],["total_cents",1],["price_cents",1],["refund_cents",1],["amount",100],["total",100],["price",100],["refund",100],["revenue",100]]) {
-    if (row[k] !== undefined && row[k] !== null && row[k] !== "") return Math.round(num(row[k]) * mult);
-  }
-  return 0;
-}
-
-function normalize(rows) {
-  return currentRows(rows).map(r => ({
-    raw: r,
-    id: String(first(r, ["id", "order_id", "orderId"])),
-    product: String(first(r, ["product", "product_name", "item_name", "item", "sku"])),
-    customer: String(first(r, ["customer", "customer_name", "customer_id", "buyer", "email"])),
-    region: String(first(r, ["region"])),
-    status: String(first(r, ["status", "order_status", "state"])).toLowerCase(),
-    date: String(first(r, ["business_date", "order_date", "date", "created_at", "createdAt"])),
-    cents: moneyToCents(r),
-    quantity: num(first(r, ["qty", "quantity", "units"], 1)),
-    currency: String(first(r, ["currency"], "USD"))
-  }));
-}
-
-async function load() {
-  if (cache.orders && Date.now() - cache.loadedAt < TTL_MS) return cache;
-  const rows = await fetchExport();
-  if (!rows.length) throw new Error("empty export");
-  cache.orders = normalize(rows);
-  cache.loadedAt = Date.now();
-  return cache;
-}
-
-const MONTHS = {
-  january: "01", february: "02", march: "03", april: "04", may: "05", june: "06",
-  july: "07", august: "08", september: "09", october: "10", november: "11", december: "12",
-  jan: "01", feb: "02", mar: "03", apr: "04", jun: "06", jul: "07", aug: "08", sep: "09", sept: "09", oct: "10", nov: "11", dec: "12"
-};
-
-function normText(s) { return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim(); }
-function formatDateKey(value) {
-  const s = String(value || "");
-  const m = s.match(/(20\d{2})-(\d{2})-(\d{2})/);
-  return m ? `${m[1]}-${m[2]}-${m[3]}` : "";
-}
-
-function filtersFromQuestion(q, orders) {
-  const nq = normText(q);
-  const filters = [];
-  const products = [...new Set(orders.map(o => o.product).filter(Boolean))].sort((a,b) => b.length-a.length);
-  const customers = [...new Set(orders.map(o => o.customer).filter(Boolean))].sort((a,b) => b.length-a.length);
-  const regions = [...new Set(orders.map(o => o.region).filter(Boolean))].sort((a,b) => b.length-a.length);
-
-  const findValue = (values, type) => {
-    for (const v of values) {
-      const nv = normText(v);
-      if (nv && (nq.includes(nv) || nq.includes(` ${nv} `))) return { type, value: v };
-    }
-    return null;
-  };
-  const pv = findValue(products, "product"); if (pv) filters.push(pv);
-  const cv = findValue(customers, "customer"); if (cv) filters.push(cv);
-  const rv = findValue(regions, "region"); if (rv) filters.push(rv);
-
-  const exact = q.match(/\b(20\d{2})[-\/]([01]\d)[-\/]([0-3]\d)\b/);
-  if (exact) filters.push({ type: "date", value: `${exact[1]}-${exact[2]}-${exact[3]}` });
-  const month = q.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b\s*(20\d{2})?/i);
-  if (month) filters.push({ type: "month", value: `${month[2] || new Date().getFullYear()}-${MONTHS[month[1].toLowerCase()]}` });
-  return filters;
-}
-
-function applyFilters(orders, filters) {
-  return orders.filter(o => filters.every(f => {
-    if (f.type === "product") return normText(o.product) === normText(f.value);
-    if (f.type === "customer") return normText(o.customer) === normText(f.value);
-    if (f.type === "region") return normText(o.region) === normText(f.value);
-    if (f.type === "date") return formatDateKey(o.date) === f.value;
-    if (f.type === "month") return formatDateKey(o.date).startsWith(f.value);
-    return true;
-  }));
-}
-
-function groupSum(rows, key, amount = false) {
-  const m = new Map();
-  for (const r of rows) m.set(r[key], (m.get(r[key]) || 0) + (amount ? r.cents : r.quantity));
-  return [...m.entries()].filter(([k]) => k).sort((a,b) => b[1] - a[1]);
-}
-
-function answerQuestion(question, data) {
-  const q = question.toLowerCase();
-  const orders = data.orders;
-  const filters = filtersFromQuestion(question, orders);
-  let scoped = applyFilters(orders, filters);
-
-  const statusWord = q.match(/\b(paid|refunded|refund|void|cancelled|canceled)\b/);
-  if (statusWord) {
-    const s = statusWord[1];
-    const wanted = s === "refund" ? "refunded" : s === "cancelled" || s === "canceled" ? "void" : s;
-    scoped = scoped.filter(o => o.status === wanted);
-  }
-
-  const isCount = /\b(how many|number of|count of|count)\b/.test(q);
-  const isQty = /\b(quantity|quantities|units|items|how much .*sold)\b/.test(q) && !/\bhow much (money|revenue|sales)\b/.test(q);
-  const isAverage = /\b(average|avg|mean)\b/.test(q);
-  const isTop = /\b(top|best|highest|largest|most|leading|biggest)\b/.test(q);
-  const wantsProduct = /\b(product|products|item|items)\b/.test(q);
-  const wantsCustomer = /\b(customer|customers|buyer|buyers)\b/.test(q);
-  const wantsRegion = /\b(region|regions)\b/.test(q);
-  const wantsRefund = /\brefund/.test(q);
-  const wantsRevenue = /\b(revenue|sales|turnover|income)\b/.test(q);
-  const wantsOrders = /\b(order|orders|order count|transactions|transactions)\b/.test(q);
-
-  if (isTop && wantsProduct) {
-    const base = scoped.filter(o => !statusWord || o.status === "paid");
-    const by = /\b(quantity|units|sold)\b/.test(q) ? groupSum(base, "product", false) : groupSum(base, "product", true);
-    return by.length ? String(by[0][0]) : "";
-  }
-  if (isTop && wantsCustomer) {
-    const base = scoped.filter(o => !statusWord || o.status === "paid");
-    const by = /\b(order|orders|count|number)\b/.test(q) && !wantsRevenue ? groupSum(base, "customer", false).map(([k]) => [k, base.filter(o => o.customer === k).length]) : groupSum(base, "customer", true);
-    return by.length ? String(by[0][0]) : "";
-  }
-  if (isTop && wantsRegion) {
-    const base = scoped.filter(o => !statusWord || o.status === "paid");
-    const by = wantsRevenue ? groupSum(base, "region", true) : groupSum(base, "region", false);
-    return by.length ? String(by[0][0]) : "";
-  }
-
-  if (wantsRefund) {
-    const refunded = scoped.filter(o => o.status === "refunded");
-    if (isCount || wantsOrders) return String(refunded.length);
-    if (isAverage) return String(refunded.length ? Math.round(refunded.reduce((s,o) => s + o.cents, 0) / refunded.length) : 0);
-    return String(refunded.reduce((s,o) => s + o.cents, 0));
-  }
-
-  if (wantsRevenue) {
-    const paid = scoped.filter(o => o.status === "paid");
-    if (isCount || wantsOrders) return String(paid.length);
-    if (isAverage) return String(paid.length ? Math.round(paid.reduce((s,o) => s + o.cents, 0) / paid.length) : 0);
-    return String(paid.reduce((s,o) => s + o.cents, 0));
-  }
-
-  if (isCount || wantsOrders) {
-    if (wantsProduct || wantsCustomer || wantsRegion || statusWord || filters.length) return String(scoped.length);
-    return String(scoped.length);
-  }
-
-  if (isQty || /\bhow many (units|items)\b/.test(q)) return String(scoped.reduce((s,o) => s + o.quantity, 0));
-
-  if (wantsProduct) {
-    if (wantsRevenue) return String(scoped.filter(o => o.status === "paid").reduce((s,o) => s + o.cents, 0));
-    return String(scoped.reduce((s,o) => s + o.quantity, 0));
-  }
-  if (wantsCustomer && (isAverage || /\bspend|spent|spending|purchase value\b/.test(q))) {
-    const paid = scoped.filter(o => o.status === "paid");
-    return String(isAverage ? (paid.length ? Math.round(paid.reduce((s,o) => s + o.cents, 0) / paid.length) : 0) : paid.reduce((s,o) => s + o.cents, 0));
-  }
-
-  return "0";
-}
-
-export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
-  try {
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-    const question = body?.question;
-    if (typeof question !== "string" || !question.trim()) return res.status(400).json({ error: "question is required" });
-    const data = await load();
-    return res.status(200).json({ answer: answerQuestion(question, data) });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Unable to answer question" });
-  }
-}
+function env(n){if(!process.env[n])throw Error(`Missing environment variable: ${n}`);return process.env[n];}
+function upstream(path){const u=new URL('https://exam.sanand.workers.dev/questionData');u.searchParams.set('email',env('QUIZ_EMAIL'));u.searchParams.set('quizSign',env('QUIZ_SIGN'));u.searchParams.set('questionId','q-ledger-agent-server');u.searchParams.set('path',path);return u.toString();}
+function unwrap(v){if(Array.isArray(v))return v;if(!v||typeof v!=='object')return [];for(const k of ['orders','data','rows','results','records','items'])if(Array.isArray(v[k]))return v[k];return [];}
+function ndjson(t){const a=[];for(const l of t.replace(/^\uFEFF/,'').split(/\r?\n/)){const s=l.trim();if(!s)continue;const v=JSON.parse(s);if(Array.isArray(v))a.push(...v);else if(v&&typeof v==='object')a.push(v);}return a;}
+async function fetchExport(){const r=await fetch(upstream('/export'),{cache:'no-store'}),t=await r.text(),ct=r.headers.get('content-type')||'';if(!r.ok)throw Error(`Export HTTP ${r.status}`);if(ct.includes('ndjson')||t.trim().startsWith('{')){try{const a=unwrap(JSON.parse(t));if(a.length)return a;}catch{}return ndjson(t);}try{return unwrap(JSON.parse(t));}catch{return [];}}
+function current(rows){const m=new Map();for(const r of rows){const id=String(r.id??r.order_id??r.orderId??'');if(!id)continue;const d=r.updated_at??r.updatedAt??r.created_at??r.createdAt??'';const old=m.get(id);if(!old||new Date(d).getTime()>=new Date(old._d).getTime())m.set(id,{...r,_d:d});}return [...m.values()];}
+function num(v){const n=Number(String(v??'').replace(/[$,\s]/g,''));return Number.isFinite(n)?n:0;}
+function first(r,ks,fb=''){for(const k of ks)if(r[k]!==undefined&&r[k]!==null&&r[k]!=='')return r[k];return fb;}
+function cents(r){for(const [k,m] of [['amount_cents',1],['total_cents',1],['price_cents',1],['refund_cents',1],['amount',100],['total',100],['price',100],['refund',100],['revenue',100]])if(r[k]!==undefined&&r[k]!==null&&r[k]!=='')return Math.round(num(r[k])*m);return 0;}
+function normalize(rows){return current(rows).map(r=>({id:String(first(r,['id','order_id','orderId'])),product:String(first(r,['product','product_name','item_name','item','sku'])),customer:String(first(r,['customer','customer_name','customer_id','buyer','email'])),region:String(first(r,['region'])),status:String(first(r,['status','order_status','state'])).toLowerCase(),date:String(first(r,['business_date','order_date','date','created_at','createdAt'])),cents:cents(r),quantity:num(first(r,['qty','quantity','units'],1)),currency:String(first(r,['currency'],'USD'))}));}
+async function load(){if(cache.orders&&Date.now()-cache.loadedAt<TTL_MS)return cache;const rows=await fetchExport();if(!rows.length)throw Error('empty export');cache={orders:normalize(rows),loadedAt:Date.now()};return cache;}
+const MONTHS={january:'01',february:'02',march:'03',april:'04',may:'05',june:'06',july:'07',august:'08',september:'09',october:'10',november:'11',december:'12',jan:'01',feb:'02',mar:'03',apr:'04',jun:'06',jul:'07',aug:'08',sep:'09',sept:'09',oct:'10',nov:'11',dec:'12'};
+function norm(s){return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();}
+function dateKey(v){const m=String(v||'').match(/(20\d{2})-(\d{2})-(\d{2})/);return m?m[0]:'';}
+function filters(q,orders){const nq=norm(q),out=[];for(const [type,vals] of [['product',[...new Set(orders.map(o=>o.product).filter(Boolean))]],['customer',[...new Set(orders.map(o=>o.customer).filter(Boolean))]],['region',[...new Set(orders.map(o=>o.region).filter(Boolean))]]]){vals.sort((a,b)=>b.length-a.length);const v=vals.find(x=>nq.includes(norm(x)));if(v)out.push({type,value:v});}const d=q.match(/\b(20\d{2})[-\/]([01]\d)[-\/]([0-3]\d)\b/);if(d)out.push({type:'date',value:`${d[1]}-${d[2]}-${d[3]}`});const m=q.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b\s*(20\d{2})?/i);if(m)out.push({type:'month',value:`${m[2]||new Date().getFullYear()}-${MONTHS[m[1].toLowerCase()]}`});return out;}
+function apply(rows,fs){return rows.filter(o=>fs.every(f=>f.type==='product'?norm(o.product)===norm(f.value):f.type==='customer'?norm(o.customer)===norm(f.value):f.type==='region'?norm(o.region)===norm(f.value):f.type==='date'?dateKey(o.date)===f.value:f.type==='month'?dateKey(o.date).startsWith(f.value):true));}
+function group(rows,key,amount){const m=new Map();for(const r of rows)if(r[key])m.set(r[key],(m.get(r[key])||0)+(amount?r.cents:r.quantity));return [...m].sort((a,b)=>(m.get(b)-m.get(a))).map(k=>[k,m.get(k)]);}
+function answer(question,data){const q=question.toLowerCase(),orders=data.orders;let s=apply(orders,filters(question,orders));const sw=q.match(/\b(paid|refunded|refund|void|cancelled|canceled)\b/);if(sw){let st=sw[1];if(st==='refund')st='refunded';if(st==='cancelled'||st==='canceled')st='void';s=s.filter(o=>o.status===st);}
+const count=/\b(how many|number of|count of|count)\b/.test(q),qty=/\b(quantity|quantities|units|items|how much .*sold)\b/.test(q),avg=/\b(average|avg|mean)\b/.test(q),top=/\b(top|best|highest|largest|most|leading|biggest)\b/.test(q),product=/\b(product|products|item|items)\b/.test(q),customer=/\b(customer|customers|buyer|buyers)\b/.test(q),region=/\b(region|regions)\b/.test(q),refund=/\brefund/.test(q),revenue=/\b(revenue|sales|turnover|income)\b/.test(q),ordersQ=/\b(order|orders|transactions)\b/.test(q),distinct=/\b(distinct|unique|different)\b/.test(q);
+if(count&&distinct&&customer)return String(new Set(s.map(o=>o.customer).filter(Boolean)).size);
+if(top&&product){const b=s.filter(o=>!sw||o.status==='paid'),g=group(b,'product',!/\b(quantity|units|sold)\b/.test(q));return g.length?String(g[0][0]):'';}
+if(top&&customer){const b=s.filter(o=>!sw||o.status==='paid'),m=new Map();for(const o of b)if(o.customer)m.set(o.customer,(m.get(o.customer)||0)+(revenue?o.cents:1));const a=[...m.entries()].sort((x,y)=>y[1]-x[1]);return a.length?String(a[0][0]):'';}
+if(top&&region){const b=s.filter(o=>!sw||o.status==='paid'),g=group(b,'region',revenue);return g.length?String(g[0][0]):'';}
+if(refund){const b=s.filter(o=>o.status==='refunded');if(count||ordersQ)return String(b.length);if(avg)return String(b.length?Math.round(b.reduce((x,o)=>x+o.cents,0)/b.length):0);return String(b.reduce((x,o)=>x+o.cents,0));}
+if(revenue){const b=s.filter(o=>o.status==='paid');if(count||ordersQ)return String(b.length);if(avg)return String(b.length?Math.round(b.reduce((x,o)=>x+o.cents,0)/b.length):0);return String(b.reduce((x,o)=>x+o.cents,0));}
+if(count||ordersQ)return String(s.length);
+if(qty||/\bhow many (units|items)\b/.test(q))return String(s.reduce((x,o)=>x+o.quantity,0));
+if(product)return String(s.filter(o=>o.status==='paid').reduce((x,o)=>x+o.quantity,0));
+if(customer&&(/\bspend|spent|spending|purchase value\b/.test(q)||avg)){const b=s.filter(o=>o.status==='paid');return String(avg?(b.length?Math.round(b.reduce((x,o)=>x+o.cents,0)/b.length):0):b.reduce((x,o)=>x+o.cents,0));}
+return '0';}
+export default async function handler(req,res){res.setHeader('Access-Control-Allow-Origin','*');res.setHeader('Access-Control-Allow-Methods','POST, OPTIONS');res.setHeader('Access-Control-Allow-Headers','Content-Type');if(req.method==='OPTIONS')return res.status(204).end();if(req.method!=='POST')return res.status(405).json({error:'Use POST'});try{const body=typeof req.body==='string'?JSON.parse(req.body):req.body;if(typeof body?.question!=='string'||!body.question.trim())return res.status(400).json({error:'question is required'});const data=await load();return res.status(200).json({answer:answer(body.question,data)});}catch(e){console.error(e);return res.status(500).json({error:'Unable to answer question'});}}
