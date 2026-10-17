@@ -14,7 +14,7 @@ function answer(q,os){const l=q.toLowerCase();let r=apply(os,filters(q,os));cons
 if(top&&product){const m=quantity?o=>o.quantity:o=>o.amountUsd,t=new Map;r.filter(o=>o.status==='paid').forEach(o=>t.set(o.product,(t.get(o.product)||0)+m(o)));return String([...t].sort((a,b)=>b[1]-a[1])[0]?.[0]||'')}
 if(top&&customer){const m=spend||revenue||/\b(?:value|sales)\b/.test(l)?o=>o.amountUsd:()=>1,t=new Map;r.filter(o=>o.status==='paid').forEach(o=>t.set(o.customer,(t.get(o.customer)||0)+m(o)));return String([...t].sort((a,b)=>b[1]-a[1])[0]?.[0]||'')}
 if(top&&region){const m=quantity?o=>o.quantity:orders&&!revenue?()=>1:o=>o.amountUsd,t=new Map;r.filter(o=>o.status==='paid').forEach(o=>t.set(o.region,(t.get(o.region)||0)+m(o)));return String([...t].sort((a,b)=>b[1]-a[1])[0]?.[0]||'')}
-if(count&&customer&&!orders)return String(uniq(r,'customer'));if(count&&distinct&&product)return String(uniq(r,'product'));if(count&&distinct&&region)return String(uniq(r,'region'));
+if(count&&distinct&&customer)return String(uniq(r,'customer'));if(count&&distinct&&product)return String(uniq(r,'product'));if(count&&distinct&&region)return String(uniq(r,'region'));if(count&&customer&&!orders)return String(uniq(r,'customer'));
 if(average&&customer&&spend){const p=r.filter(o=>o.status==='paid'),c=uniq(p,'customer');return money(c?sum(p,o=>o.amountUsd)/c:0)}
 if(average&&(revenue||orders||/\b(?:value|worth)\b/.test(l))){const p=(ref||vo)?r:r.filter(o=>o.status==='paid');return money(avg(p,o=>o.amountUsd))}
 if(ref){const x=r.filter(o=>o.status==='refunded');if(average)return money(avg(x,o=>o.amountUsd));if(count||orders)return String(x.length);return money(sum(x,o=>o.amountUsd))}
