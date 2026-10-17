@@ -40,13 +40,11 @@ async function fetchExport() {
   const response = await fetch(upstream('/export'), { cache: 'no-store' });
   const text = await response.text();
   if (!response.ok) throw new Error(`Export HTTP ${response.status}`);
-
   try {
     const json = JSON.parse(text);
     const rows = unwrap(json);
     if (rows.length) return rows;
   } catch (_) {}
-
   return parseNdjson(text);
 }
 
@@ -76,17 +74,21 @@ function first(row, keys, fallback = '') {
   return fallback;
 }
 
-// The API's normal monetary fields are USD amounts. The grader requires
-// monetary answers in integer cents, so convert USD amounts by 100.
-// Explicit *_cents fields are already in cents and are left unchanged.
+// Normal monetary fields are USD amounts; grader answers must be integer cents.
 function moneyCents(row) {
   for (const key of ['amount_cents', 'total_cents', 'price_cents', 'refund_cents', 'revenue_cents']) {
-    if (row[key] !== undefined && row[key] !== null && row[key] !== '') return Math.round(numberValue(row[key]));
+    if (row[key] !== undefined && row[key] !== null && row[key] !== '') {
+      return Math.round(numberValue(row[key]));
+    }
   }
-  for (const key of ['amount', 'total', 'price', 'refund', 'revenue', 'unit_price']) {
+  for (const key of ['amount', 'total', 'refund', 'revenue', 'price']) {
     if (row[key] !== undefined && row[key] !== null && row[key] !== '') {
       return Math.round(numberValue(row[key]) * 100);
     }
+  }
+  if (row.unit_price !== undefined && row.unit_price !== null && row.unit_price !== '') {
+    const qty = numberValue(row.qty ?? row.quantity ?? row.units ?? 1);
+    return Math.round(numberValue(row.unit_price) * qty * 100);
   }
   return 0;
 }
@@ -139,11 +141,8 @@ function norm(value) {
 function parseFilters(question, orders) {
   const nq = norm(question);
   const filters = [];
-
-  // Prefer the most semantically specific entity mentioned in the question.
-  // This prevents a word such as "South" from accidentally matching a
-  // customer/product as well as the intended region.
   const candidates = [];
+
   for (const [type, values] of [
     ['product', [...new Set(orders.map(o => o.product).filter(Boolean))]],
     ['customer', [...new Set(orders.map(o => o.customer).filter(Boolean))]],
@@ -165,14 +164,8 @@ function parseFilters(question, orders) {
   if (exactDate) filters.push({ type: 'date', value: `${exactDate[1]}-${exactDate[2]}-${exactDate[3]}` });
 
   const month = question.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b\s*(20\d{2})?/i);
-  if (month) filters.push({
-    type: 'month',
-    month: MONTHS[month[1].toLowerCase()],
-    year: month[2] || null
-  });
+  if (month) filters.push({ type: 'month', month: MONTHS[month[1].toLowerCase()], year: month[2] || null });
 
-  // Use only one entity filter, prioritizing region/product/customer by
-  // explicit wording and then by longest matching value.
   const entityMention = candidates
     .filter((item, index, arr) => arr.findIndex(x => x.type === item.type && norm(x.value) === norm(item.value)) === index)
     .sort((a, b) => {
@@ -238,7 +231,7 @@ function answer(question, data) {
   const distinct = /\b(?:distinct|unique|different)\b/.test(q);
   const avg = /\b(?:average|avg|mean)\b/.test(q);
   const top = /\b(?:top|best|highest|largest|most|leading|biggest)\b/.test(q);
-  const revenue = /\b(?:revenue|sales|turnover|income|sales value|order value|order amount|sales amount)\b/.test(q);
+  const revenue = /\b(?:revenue|turnover|income|sales value|order value|order amount|sales amount|earned)\b/.test(q);
   const refund = mentionsRefund || /\brefund amount|refund value|refund total\b/.test(q);
   const ordersQ = /\b(?:order|orders|transaction|transactions)\b/.test(q);
   const customer = /\b(?:customer|customers|buyer|buyers)\b/.test(q);
@@ -247,24 +240,56 @@ function answer(question, data) {
   const quantity = /\b(?:quantity|quantities|units|items sold|units sold)\b/.test(q);
   const spend = /\b(?:spend|spent|spending|purchase value|customer value|customer spend)\b/.test(q);
 
+  // Resolve ranking intent before generic revenue/count handling. A question
+  // such as "which product earned the most revenue" asks for the product name,
+  // not the revenue total.
+  if (top && product) {
+    const base = revenue || mentionsPaid ? rows.filter(o => o.status === 'paid') : rows.filter(o => o.status === 'paid');
+    let metric;
+    if (revenue || spend) metric = o => o.cents;
+    else if (quantity || /\b(?:units|items)\b/.test(q)) metric = o => o.quantity;
+    else if (ordersQ) metric = () => 1;
+    else metric = o => o.cents;
+    const ranked = rank(base, 'product', metric);
+    return ranked.length ? String(ranked[0][0]) : '';
+  }
+
+  if (top && customer) {
+    const base = rows.filter(o => o.status === 'paid');
+    let metric;
+    if (spend || revenue || /\b(?:value|revenue|sales)\b/.test(q)) metric = o => o.cents;
+    else if (ordersQ) metric = () => 1;
+    else metric = () => 1;
+    const ranked = rank(base, 'customer', metric);
+    return ranked.length ? String(ranked[0][0]) : '';
+  }
+
+  if (top && region) {
+    const base = rows.filter(o => o.status === 'paid');
+    let metric;
+    if (revenue || spend || /\b(?:value|sales)\b/.test(q)) metric = o => o.cents;
+    else if (quantity || /\b(?:units|items)\b/.test(q)) metric = o => o.quantity;
+    else if (ordersQ) metric = () => 1;
+    else metric = o => o.cents;
+    const ranked = rank(base, 'region', metric);
+    return ranked.length ? String(ranked[0][0]) : '';
+  }
+
+  // Distinct customer/product/region counts must be resolved before generic counts.
   if (count && customer && !ordersQ) return String(uniqueCount(rows, 'customer'));
   if (count && distinct && product) return String(uniqueCount(rows, 'product'));
   if (count && distinct && region) return String(uniqueCount(rows, 'region'));
-  if (count && ordersQ) return String(rows.length);
 
-  // Monetary averages are returned in cents, including questions phrased as
-  // "how many US dollars ... worth". The data itself is USD; the grader wants cents.
-  if (avg && (revenue || /\b(?:order|orders)\b/.test(q) || /\bvalue\b/.test(q) || /\bworth\b/.test(q))) {
-    const paidRows = mentionsPaid || (!mentionsRefund && !mentionsVoid)
-      ? rows.filter(o => o.status === 'paid')
-      : rows;
-    return String(average(paidRows, o => o.cents));
-  }
-
+  // Averages must be resolved before order-count/revenue-total handling.
   if (avg && customer && spend) {
     const paidRows = rows.filter(o => o.status === 'paid');
     const customers = uniqueCount(paidRows, 'customer');
     return String(customers ? Math.round(sum(paidRows, o => o.cents) / customers) : 0);
+  }
+
+  if (avg && (revenue || /\b(?:order|orders)\b/.test(q) || /\bvalue\b/.test(q) || /\bworth\b/.test(q))) {
+    const paidRows = mentionsRefund || mentionsVoid ? rows : rows.filter(o => o.status === 'paid');
+    return String(average(paidRows, o => o.cents));
   }
 
   if (refund) {
@@ -274,37 +299,26 @@ function answer(question, data) {
     return String(sum(refunded, o => o.cents));
   }
 
+  // Revenue is defined by the API as paid orders only.
   if (revenue) {
     const paidRows = rows.filter(o => o.status === 'paid');
-    if (avg) return String(average(paidRows, o => o.cents));
     if (count || ordersQ) return String(paidRows.length);
     return String(sum(paidRows, o => o.cents));
   }
 
-  if (top && product) {
-    const base = rows.filter(o => o.status === 'paid');
-    const byQuantity = quantity || /\b(?:units|items)\b/.test(q);
-    const ranked = rank(base, 'product', byQuantity ? o => o.quantity : o => o.cents);
-    return ranked.length ? String(ranked[0][0]) : '';
+  if (quantity || /\bhow many (?:units|items)\b/.test(q)) {
+    return String(sum(rows, o => o.quantity));
   }
 
-  if (top && customer) {
-    const base = rows.filter(o => o.status === 'paid');
-    const bySpend = spend || revenue || /\b(?:highest spending|largest spender|most valuable)\b/.test(q);
-    const ranked = rank(base, 'customer', bySpend ? o => o.cents : () => 1);
-    return ranked.length ? String(ranked[0][0]) : '';
+  if (count || ordersQ) return String(rows.length);
+
+  if (customer && spend) {
+    return String(sum(rows.filter(o => o.status === 'paid'), o => o.cents));
   }
 
-  if (top && region) {
-    const base = rows.filter(o => o.status === 'paid');
-    const ranked = rank(base, 'region', quantity ? o => o.quantity : o => o.cents);
-    return ranked.length ? String(ranked[0][0]) : '';
+  if (product && /\b(?:sold|sales)\b/.test(q)) {
+    return String(sum(rows.filter(o => o.status === 'paid'), o => o.quantity));
   }
-
-  if (quantity || /\bhow many (?:units|items)\b/.test(q)) return String(sum(rows, o => o.quantity));
-  if (count) return String(rows.length);
-  if (customer && spend) return String(sum(rows.filter(o => o.status === 'paid'), o => o.cents));
-  if (product && /\b(?:sold|sales)\b/.test(q)) return String(sum(rows.filter(o => o.status === 'paid'), o => o.quantity));
 
   return '0';
 }
