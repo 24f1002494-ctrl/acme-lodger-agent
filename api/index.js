@@ -26,6 +26,7 @@ if(top&&customer){const b=s.filter(o=>!sw||o.status==='paid'),m=new Map();for(co
 if(top&&region){const b=s.filter(o=>!sw||o.status==='paid'),g=group(b,'region',revenue);return g.length?String(g[0][0]):'';}
 if(refund){const b=s.filter(o=>o.status==='refunded');if(count||ordersQ)return String(b.length);if(avg)return String(b.length?Math.round(b.reduce((x,o)=>x+o.cents,0)/b.length):0);return String(b.reduce((x,o)=>x+o.cents,0));}
 if(revenue){const b=s.filter(o=>o.status==='paid');if(count||ordersQ)return String(b.length);if(avg)return String(b.length?Math.round(b.reduce((x,o)=>x+o.cents,0)/b.length):0);return String(b.reduce((x,o)=>x+o.cents,0));}
+if(avg){const b=sw?s:s.filter(o=>o.status==='paid');return String(b.length?Math.round(b.reduce((x,o)=>x+o.cents,0)/b.length):0);}
 if(count||ordersQ)return String(s.length);
 if(qty||/\bhow many (units|items)\b/.test(q))return String(s.reduce((x,o)=>x+o.quantity,0));
 if(product)return String(s.filter(o=>o.status==='paid').reduce((x,o)=>x+o.quantity,0));
