@@ -53,13 +53,9 @@ function parseNdjson(text) {
   for (const line of text.replace(/^\uFEFF/, "").split(/\r?\n/)) {
     const s = line.trim();
     if (!s) continue;
-    try {
-      const value = JSON.parse(s);
-      if (Array.isArray(value)) rows.push(...value);
-      else if (value && typeof value === "object") rows.push(value);
-    } catch (e) {
-      throw new Error(`Invalid NDJSON line: ${s.slice(0, 80)}`);
-    }
+    const value = JSON.parse(s);
+    if (Array.isArray(value)) rows.push(...value);
+    else if (value && typeof value === "object") rows.push(value);
   }
   return rows;
 }
@@ -68,9 +64,7 @@ async function fetchExport() {
   const r = await fetch(upstream("/export"), { cache: "no-store" });
   const text = await r.text();
   const ct = r.headers.get("content-type") || "";
-  console.log("LEDGER_EXPORT", JSON.stringify({ httpStatus: r.status, contentType: ct, bytes: Buffer.byteLength(text), prefix: text.slice(0, 80) }));
   if (!r.ok) throw new Error(`Export HTTP ${r.status}`);
-
   if (ct.includes("ndjson") || text.trim().startsWith("{")) {
     try {
       const parsed = JSON.parse(text);
@@ -97,22 +91,6 @@ function currentRows(rows) {
   return [...byId.values()];
 }
 
-function logSchema(rows, current) {
-  const allKeys = new Set();
-  for (const row of rows.slice(0, 100)) Object.keys(row || {}).forEach(k => allKeys.add(k));
-  const statuses = {};
-  for (const row of current) {
-    const s = row.status;
-    if (s !== undefined) statuses[String(s)] = (statuses[String(s)] || 0) + 1;
-  }
-  console.log("LEDGER_SCHEMA", JSON.stringify({
-    rowCount: rows.length,
-    currentRows: current.length,
-    keys: [...allKeys].sort(),
-    statusCounts: statuses
-  }));
-}
-
 function num(v) {
   const n = Number(String(v ?? "").replace(/[$,\s]/g, ""));
   return Number.isFinite(n) ? n : 0;
@@ -129,13 +107,12 @@ function moneyToCents(row) {
 }
 
 function normalize(rows) {
-  const current = currentRows(rows);
-  logSchema(rows, current);
-  return current.map(r => ({
+  return currentRows(rows).map(r => ({
     raw: r,
     id: String(first(r, ["id", "order_id", "orderId"])),
     product: String(first(r, ["product", "product_name", "item_name", "item", "sku"])),
     customer: String(first(r, ["customer", "customer_name", "customer_id", "buyer", "email"])),
+    region: String(first(r, ["region"])),
     status: String(first(r, ["status", "order_status", "state"])).toLowerCase(),
     date: String(first(r, ["business_date", "order_date", "date", "created_at", "createdAt"])),
     cents: moneyToCents(r),
@@ -153,13 +130,131 @@ async function load() {
   return cache;
 }
 
+const MONTHS = {
+  january: "01", february: "02", march: "03", april: "04", may: "05", june: "06",
+  july: "07", august: "08", september: "09", october: "10", november: "11", december: "12",
+  jan: "01", feb: "02", mar: "03", apr: "04", jun: "06", jul: "07", aug: "08", sep: "09", sept: "09", oct: "10", nov: "11", dec: "12"
+};
+
+function normText(s) { return String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim(); }
+function formatDateKey(value) {
+  const s = String(value || "");
+  const m = s.match(/(20\d{2})-(\d{2})-(\d{2})/);
+  return m ? `${m[1]}-${m[2]}-${m[3]}` : "";
+}
+
+function filtersFromQuestion(q, orders) {
+  const nq = normText(q);
+  const filters = [];
+  const products = [...new Set(orders.map(o => o.product).filter(Boolean))].sort((a,b) => b.length-a.length);
+  const customers = [...new Set(orders.map(o => o.customer).filter(Boolean))].sort((a,b) => b.length-a.length);
+  const regions = [...new Set(orders.map(o => o.region).filter(Boolean))].sort((a,b) => b.length-a.length);
+
+  const findValue = (values, type) => {
+    for (const v of values) {
+      const nv = normText(v);
+      if (nv && (nq.includes(nv) || nq.includes(` ${nv} `))) return { type, value: v };
+    }
+    return null;
+  };
+  const pv = findValue(products, "product"); if (pv) filters.push(pv);
+  const cv = findValue(customers, "customer"); if (cv) filters.push(cv);
+  const rv = findValue(regions, "region"); if (rv) filters.push(rv);
+
+  const exact = q.match(/\b(20\d{2})[-\/]([01]\d)[-\/]([0-3]\d)\b/);
+  if (exact) filters.push({ type: "date", value: `${exact[1]}-${exact[2]}-${exact[3]}` });
+  const month = q.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b\s*(20\d{2})?/i);
+  if (month) filters.push({ type: "month", value: `${month[2] || new Date().getFullYear()}-${MONTHS[month[1].toLowerCase()]}` });
+  return filters;
+}
+
+function applyFilters(orders, filters) {
+  return orders.filter(o => filters.every(f => {
+    if (f.type === "product") return normText(o.product) === normText(f.value);
+    if (f.type === "customer") return normText(o.customer) === normText(f.value);
+    if (f.type === "region") return normText(o.region) === normText(f.value);
+    if (f.type === "date") return formatDateKey(o.date) === f.value;
+    if (f.type === "month") return formatDateKey(o.date).startsWith(f.value);
+    return true;
+  }));
+}
+
+function groupSum(rows, key, amount = false) {
+  const m = new Map();
+  for (const r of rows) m.set(r[key], (m.get(r[key]) || 0) + (amount ? r.cents : r.quantity));
+  return [...m.entries()].filter(([k]) => k).sort((a,b) => b[1] - a[1]);
+}
+
 function answerQuestion(question, data) {
   const q = question.toLowerCase();
-  const paid = data.orders.filter(o => o.status === "paid");
-  if (q.includes("revenue") || q.includes("sales") || q.includes("turnover"))
-    return String(paid.reduce((s, o) => s + o.cents, 0));
-  if (q.includes("refund"))
-    return String(data.orders.filter(o => ["refund", "refunded", "partially_refunded"].includes(o.status)).reduce((s, o) => s + o.cents, 0));
+  const orders = data.orders;
+  const filters = filtersFromQuestion(question, orders);
+  let scoped = applyFilters(orders, filters);
+
+  const statusWord = q.match(/\b(paid|refunded|refund|void|cancelled|canceled)\b/);
+  if (statusWord) {
+    const s = statusWord[1];
+    const wanted = s === "refund" ? "refunded" : s === "cancelled" || s === "canceled" ? "void" : s;
+    scoped = scoped.filter(o => o.status === wanted);
+  }
+
+  const isCount = /\b(how many|number of|count of|count)\b/.test(q);
+  const isQty = /\b(quantity|quantities|units|items|how much .*sold)\b/.test(q) && !/\bhow much (money|revenue|sales)\b/.test(q);
+  const isAverage = /\b(average|avg|mean)\b/.test(q);
+  const isTop = /\b(top|best|highest|largest|most|leading|biggest)\b/.test(q);
+  const wantsProduct = /\b(product|products|item|items)\b/.test(q);
+  const wantsCustomer = /\b(customer|customers|buyer|buyers)\b/.test(q);
+  const wantsRegion = /\b(region|regions)\b/.test(q);
+  const wantsRefund = /\brefund/.test(q);
+  const wantsRevenue = /\b(revenue|sales|turnover|income)\b/.test(q);
+  const wantsOrders = /\b(order|orders|order count|transactions|transactions)\b/.test(q);
+
+  if (isTop && wantsProduct) {
+    const base = scoped.filter(o => !statusWord || o.status === "paid");
+    const by = /\b(quantity|units|sold)\b/.test(q) ? groupSum(base, "product", false) : groupSum(base, "product", true);
+    return by.length ? String(by[0][0]) : "";
+  }
+  if (isTop && wantsCustomer) {
+    const base = scoped.filter(o => !statusWord || o.status === "paid");
+    const by = /\b(order|orders|count|number)\b/.test(q) && !wantsRevenue ? groupSum(base, "customer", false).map(([k]) => [k, base.filter(o => o.customer === k).length]) : groupSum(base, "customer", true);
+    return by.length ? String(by[0][0]) : "";
+  }
+  if (isTop && wantsRegion) {
+    const base = scoped.filter(o => !statusWord || o.status === "paid");
+    const by = wantsRevenue ? groupSum(base, "region", true) : groupSum(base, "region", false);
+    return by.length ? String(by[0][0]) : "";
+  }
+
+  if (wantsRefund) {
+    const refunded = scoped.filter(o => o.status === "refunded");
+    if (isCount || wantsOrders) return String(refunded.length);
+    if (isAverage) return String(refunded.length ? Math.round(refunded.reduce((s,o) => s + o.cents, 0) / refunded.length) : 0);
+    return String(refunded.reduce((s,o) => s + o.cents, 0));
+  }
+
+  if (wantsRevenue) {
+    const paid = scoped.filter(o => o.status === "paid");
+    if (isCount || wantsOrders) return String(paid.length);
+    if (isAverage) return String(paid.length ? Math.round(paid.reduce((s,o) => s + o.cents, 0) / paid.length) : 0);
+    return String(paid.reduce((s,o) => s + o.cents, 0));
+  }
+
+  if (isCount || wantsOrders) {
+    if (wantsProduct || wantsCustomer || wantsRegion || statusWord || filters.length) return String(scoped.length);
+    return String(scoped.length);
+  }
+
+  if (isQty || /\bhow many (units|items)\b/.test(q)) return String(scoped.reduce((s,o) => s + o.quantity, 0));
+
+  if (wantsProduct) {
+    if (wantsRevenue) return String(scoped.filter(o => o.status === "paid").reduce((s,o) => s + o.cents, 0));
+    return String(scoped.reduce((s,o) => s + o.quantity, 0));
+  }
+  if (wantsCustomer && (isAverage || /\bspend|spent|spending|purchase value\b/.test(q))) {
+    const paid = scoped.filter(o => o.status === "paid");
+    return String(isAverage ? (paid.length ? Math.round(paid.reduce((s,o) => s + o.cents, 0) / paid.length) : 0) : paid.reduce((s,o) => s + o.cents, 0));
+  }
+
   return "0";
 }
 
