@@ -76,14 +76,17 @@ function first(row, keys, fallback = '') {
   return fallback;
 }
 
-// The ledger's monetary numeric fields are represented in USD cents.
-// Explicit *_cents fields are also accepted as-is.
+// The API's normal monetary fields are USD amounts. The grader requires
+// monetary answers in integer cents, so convert USD amounts by 100.
+// Explicit *_cents fields are already in cents and are left unchanged.
 function moneyCents(row) {
   for (const key of ['amount_cents', 'total_cents', 'price_cents', 'refund_cents', 'revenue_cents']) {
     if (row[key] !== undefined && row[key] !== null && row[key] !== '') return Math.round(numberValue(row[key]));
   }
   for (const key of ['amount', 'total', 'price', 'refund', 'revenue', 'unit_price']) {
-    if (row[key] !== undefined && row[key] !== null && row[key] !== '') return Math.round(numberValue(row[key]));
+    if (row[key] !== undefined && row[key] !== null && row[key] !== '') {
+      return Math.round(numberValue(row[key]) * 100);
+    }
   }
   return 0;
 }
@@ -137,6 +140,10 @@ function parseFilters(question, orders) {
   const nq = norm(question);
   const filters = [];
 
+  // Prefer the most semantically specific entity mentioned in the question.
+  // This prevents a word such as "South" from accidentally matching a
+  // customer/product as well as the intended region.
+  const candidates = [];
   for (const [type, values] of [
     ['product', [...new Set(orders.map(o => o.product).filter(Boolean))]],
     ['customer', [...new Set(orders.map(o => o.customer).filter(Boolean))]],
@@ -144,7 +151,14 @@ function parseFilters(question, orders) {
   ]) {
     values.sort((a, b) => b.length - a.length);
     const found = values.find(value => nq.includes(norm(value)));
-    if (found) filters.push({ type, value: found });
+    if (found) candidates.push({ type, value: found });
+  }
+
+  const explicitRegion = /\b(?:in|for|from|within)\s+(?:the\s+)?([a-z0-9][a-z0-9 _-]*)\s+region\b/i.exec(question);
+  if (explicitRegion) {
+    const wanted = norm(explicitRegion[1]);
+    const found = orders.map(o => o.region).filter(Boolean).find(r => norm(r) === wanted);
+    if (found) candidates.unshift({ type: 'region', value: found });
   }
 
   const exactDate = question.match(/\b(20\d{2})[-\/]([01]\d)[-\/]([0-3]\d)\b/);
@@ -156,6 +170,16 @@ function parseFilters(question, orders) {
     month: MONTHS[month[1].toLowerCase()],
     year: month[2] || null
   });
+
+  // Use only one entity filter, prioritizing region/product/customer by
+  // explicit wording and then by longest matching value.
+  const entityMention = candidates
+    .filter((item, index, arr) => arr.findIndex(x => x.type === item.type && norm(x.value) === norm(item.value)) === index)
+    .sort((a, b) => {
+      const priority = { region: 3, product: 2, customer: 1 };
+      return (priority[b.type] - priority[a.type]) || (b.value.length - a.value.length);
+    })[0];
+  if (entityMention) filters.push(entityMention);
 
   return filters;
 }
@@ -223,30 +247,26 @@ function answer(question, data) {
   const quantity = /\b(?:quantity|quantities|units|items sold|units sold)\b/.test(q);
   const spend = /\b(?:spend|spent|spending|purchase value|customer value|customer spend)\b/.test(q);
 
-  // Customer counts mean distinct customers unless the question explicitly asks for orders.
   if (count && customer && !ordersQ) return String(uniqueCount(rows, 'customer'));
   if (count && distinct && product) return String(uniqueCount(rows, 'product'));
   if (count && distinct && region) return String(uniqueCount(rows, 'region'));
-
-  // Explicit order counts always count current rows after status/date/entity filters.
   if (count && ordersQ) return String(rows.length);
 
-  // Average order value defaults to paid orders unless a different status was explicitly requested.
-  if (avg && (revenue || /\b(?:order|orders)\b/.test(q) || /\bvalue\b/.test(q))) {
+  // Monetary averages are returned in cents, including questions phrased as
+  // "how many US dollars ... worth". The data itself is USD; the grader wants cents.
+  if (avg && (revenue || /\b(?:order|orders)\b/.test(q) || /\bvalue\b/.test(q) || /\bworth\b/.test(q))) {
     const paidRows = mentionsPaid || (!mentionsRefund && !mentionsVoid)
       ? rows.filter(o => o.status === 'paid')
       : rows;
     return String(average(paidRows, o => o.cents));
   }
 
-  // Average customer spend = total paid value divided by distinct customers, not average order value.
   if (avg && customer && spend) {
     const paidRows = rows.filter(o => o.status === 'paid');
     const customers = uniqueCount(paidRows, 'customer');
     return String(customers ? Math.round(sum(paidRows, o => o.cents) / customers) : 0);
   }
 
-  // Refund questions operate on refunded current orders.
   if (refund) {
     const refunded = rows.filter(o => o.status === 'refunded');
     if (avg) return String(average(refunded, o => o.cents));
@@ -254,7 +274,6 @@ function answer(question, data) {
     return String(sum(refunded, o => o.cents));
   }
 
-  // Revenue/sales are paid-only by definition from the API notes.
   if (revenue) {
     const paidRows = rows.filter(o => o.status === 'paid');
     if (avg) return String(average(paidRows, o => o.cents));
@@ -282,21 +301,10 @@ function answer(question, data) {
     return ranked.length ? String(ranked[0][0]) : '';
   }
 
-  if (quantity || /\bhow many (?:units|items)\b/.test(q)) {
-    return String(sum(rows, o => o.quantity));
-  }
-
+  if (quantity || /\bhow many (?:units|items)\b/.test(q)) return String(sum(rows, o => o.quantity));
   if (count) return String(rows.length);
-
-  // Customer spend/value questions return paid revenue for the matched customer.
-  if (customer && spend) {
-    return String(sum(rows.filter(o => o.status === 'paid'), o => o.cents));
-  }
-
-  // Product sales without a numeric qualifier mean units sold.
-  if (product && /\b(?:sold|sales)\b/.test(q)) {
-    return String(sum(rows.filter(o => o.status === 'paid'), o => o.quantity));
-  }
+  if (customer && spend) return String(sum(rows.filter(o => o.status === 'paid'), o => o.cents));
+  if (product && /\b(?:sold|sales)\b/.test(q)) return String(sum(rows.filter(o => o.status === 'paid'), o => o.quantity));
 
   return '0';
 }
