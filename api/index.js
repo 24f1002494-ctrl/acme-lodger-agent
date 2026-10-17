@@ -74,16 +74,12 @@ function first(row, keys, fallback = '') {
   return fallback;
 }
 
-// Normal monetary fields are USD amounts; grader answers must be integer cents.
+// The ledger amount field is already expressed in USD cents. Explicit *_cents
+// fields are also cents. unit_price is USD and is converted only as a fallback.
 function moneyCents(row) {
-  for (const key of ['amount_cents', 'total_cents', 'price_cents', 'refund_cents', 'revenue_cents']) {
+  for (const key of ['amount_cents', 'total_cents', 'price_cents', 'refund_cents', 'revenue_cents', 'amount', 'total', 'refund', 'revenue']) {
     if (row[key] !== undefined && row[key] !== null && row[key] !== '') {
       return Math.round(numberValue(row[key]));
-    }
-  }
-  for (const key of ['amount', 'total', 'refund', 'revenue', 'price']) {
-    if (row[key] !== undefined && row[key] !== null && row[key] !== '') {
-      return Math.round(numberValue(row[key]) * 100);
     }
   }
   if (row.unit_price !== undefined && row.unit_price !== null && row.unit_price !== '') {
@@ -166,12 +162,10 @@ function parseFilters(question, orders) {
   const month = question.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b\s*(20\d{2})?/i);
   if (month) filters.push({ type: 'month', month: MONTHS[month[1].toLowerCase()], year: month[2] || null });
 
+  const priority = { region: 3, product: 2, customer: 1 };
   const entityMention = candidates
     .filter((item, index, arr) => arr.findIndex(x => x.type === item.type && norm(x.value) === norm(item.value)) === index)
-    .sort((a, b) => {
-      const priority = { region: 3, product: 2, customer: 1 };
-      return (priority[b.type] - priority[a.type]) || (b.value.length - a.value.length);
-    })[0];
+    .sort((a, b) => (priority[b.type] - priority[a.type]) || (b.value.length - a.value.length))[0];
   if (entityMention) filters.push(entityMention);
 
   return filters;
@@ -222,7 +216,6 @@ function answer(question, data) {
   const mentionsPaid = /\bpaid\b/.test(q);
   const mentionsRefund = /\brefund(?:ed|s)?\b/.test(q);
   const mentionsVoid = /\b(?:void|cancelled|canceled)\b/.test(q);
-
   if (mentionsPaid) rows = rows.filter(o => o.status === 'paid');
   else if (mentionsRefund) rows = rows.filter(o => o.status === 'refunded');
   else if (mentionsVoid) rows = rows.filter(o => o.status === 'void');
@@ -240,55 +233,38 @@ function answer(question, data) {
   const quantity = /\b(?:quantity|quantities|units|items sold|units sold)\b/.test(q);
   const spend = /\b(?:spend|spent|spending|purchase value|customer value|customer spend)\b/.test(q);
 
-  // Resolve ranking intent before generic revenue/count handling. A question
-  // such as "which product earned the most revenue" asks for the product name,
-  // not the revenue total.
+  // Ranking intent always returns the entity name.
   if (top && product) {
-    const base = revenue || mentionsPaid ? rows.filter(o => o.status === 'paid') : rows.filter(o => o.status === 'paid');
-    let metric;
-    if (revenue || spend) metric = o => o.cents;
-    else if (quantity || /\b(?:units|items)\b/.test(q)) metric = o => o.quantity;
-    else if (ordersQ) metric = () => 1;
-    else metric = o => o.cents;
+    const base = rows.filter(o => o.status === 'paid');
+    const metric = (revenue || spend) ? (o => o.cents) : quantity ? (o => o.quantity) : ordersQ ? (() => 1) : (o => o.cents);
     const ranked = rank(base, 'product', metric);
     return ranked.length ? String(ranked[0][0]) : '';
   }
-
   if (top && customer) {
     const base = rows.filter(o => o.status === 'paid');
-    let metric;
-    if (spend || revenue || /\b(?:value|revenue|sales)\b/.test(q)) metric = o => o.cents;
-    else if (ordersQ) metric = () => 1;
-    else metric = () => 1;
+    const metric = (spend || revenue || /\b(?:value|sales)\b/.test(q)) ? (o => o.cents) : (() => 1);
     const ranked = rank(base, 'customer', metric);
     return ranked.length ? String(ranked[0][0]) : '';
   }
-
   if (top && region) {
     const base = rows.filter(o => o.status === 'paid');
-    let metric;
-    if (revenue || spend || /\b(?:value|sales)\b/.test(q)) metric = o => o.cents;
-    else if (quantity || /\b(?:units|items)\b/.test(q)) metric = o => o.quantity;
-    else if (ordersQ) metric = () => 1;
-    else metric = o => o.cents;
+    const metric = (revenue || spend || /\b(?:value|sales)\b/.test(q)) ? (o => o.cents) : quantity ? (o => o.quantity) : ordersQ ? (() => 1) : (o => o.cents);
     const ranked = rank(base, 'region', metric);
     return ranked.length ? String(ranked[0][0]) : '';
   }
 
-  // Distinct customer/product/region counts must be resolved before generic counts.
   if (count && customer && !ordersQ) return String(uniqueCount(rows, 'customer'));
   if (count && distinct && product) return String(uniqueCount(rows, 'product'));
   if (count && distinct && region) return String(uniqueCount(rows, 'region'));
 
-  // Averages must be resolved before order-count/revenue-total handling.
   if (avg && customer && spend) {
     const paidRows = rows.filter(o => o.status === 'paid');
     const customers = uniqueCount(paidRows, 'customer');
     return String(customers ? Math.round(sum(paidRows, o => o.cents) / customers) : 0);
   }
 
-  if (avg && (revenue || /\b(?:order|orders)\b/.test(q) || /\bvalue\b/.test(q) || /\bworth\b/.test(q))) {
-    const paidRows = mentionsRefund || mentionsVoid ? rows : rows.filter(o => o.status === 'paid');
+  if (avg && (revenue || ordersQ || /\b(?:value|worth)\b/.test(q))) {
+    const paidRows = (mentionsRefund || mentionsVoid) ? rows : rows.filter(o => o.status === 'paid');
     return String(average(paidRows, o => o.cents));
   }
 
@@ -299,27 +275,16 @@ function answer(question, data) {
     return String(sum(refunded, o => o.cents));
   }
 
-  // Revenue is defined by the API as paid orders only.
   if (revenue) {
     const paidRows = rows.filter(o => o.status === 'paid');
     if (count || ordersQ) return String(paidRows.length);
     return String(sum(paidRows, o => o.cents));
   }
 
-  if (quantity || /\bhow many (?:units|items)\b/.test(q)) {
-    return String(sum(rows, o => o.quantity));
-  }
-
+  if (quantity || /\bhow many (?:units|items)\b/.test(q)) return String(sum(rows, o => o.quantity));
   if (count || ordersQ) return String(rows.length);
-
-  if (customer && spend) {
-    return String(sum(rows.filter(o => o.status === 'paid'), o => o.cents));
-  }
-
-  if (product && /\b(?:sold|sales)\b/.test(q)) {
-    return String(sum(rows.filter(o => o.status === 'paid'), o => o.quantity));
-  }
-
+  if (customer && spend) return String(sum(rows.filter(o => o.status === 'paid'), o => o.cents));
+  if (product && /\b(?:sold|sales)\b/.test(q)) return String(sum(rows.filter(o => o.status === 'paid'), o => o.quantity));
   return '0';
 }
 
@@ -327,15 +292,11 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST' });
-
   try {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-    if (typeof body?.question !== 'string' || !body.question.trim()) {
-      return res.status(400).json({ error: 'question is required' });
-    }
+    if (typeof body?.question !== 'string' || !body.question.trim()) return res.status(400).json({ error: 'question is required' });
     const data = await load();
     return res.status(200).json({ answer: answer(body.question, data) });
   } catch (error) {
